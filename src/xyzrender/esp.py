@@ -203,6 +203,12 @@ def build_esp_surface(
     # Density max-intensity projection (all voxels — needed for contours)
     grid_2d = np.zeros((proj_res, proj_res))
     np.maximum.at(grid_2d, (yi, xi), lobe_dens)
+    # Pixels that received at least one voxel.  The projection grid is
+    # ``_PROJ_MULT`` times finer than the cube (and covers only the lobe's
+    # bounding box), so most of its pixels receive none; the blur below is
+    # normalised by this so those empty pixels do not dilute the field.
+    hit_2d = np.zeros((proj_res, proj_res))
+    hit_2d[yi, xi] = 1.0
 
     # Shell-only pixel coords for ESP/lighting/depth
     s_xi, s_yi = xi[shell], yi[shell]
@@ -214,15 +220,21 @@ def build_esp_surface(
     s_front_wt = np.exp((s_z - s_z_max) / _FRONT_DECAY)
 
     # Shared front-weight accumulation (ESP, lighting, Z all use the same
-    # scatter coordinates and weights — accumulate once, reuse for all three)
+    # scatter coordinates and weights — accumulate once, reuse for all three).
+    #
+    # The weighted *sums* are kept as sums here and only divided by the
+    # (blurred) weights after the blur below.  The projection grid is
+    # ``_PROJ_MULT`` times finer than the cube grid, so only a few percent of
+    # its pixels ever receive a shell voxel; blurring per-pixel *means* would
+    # average them with the empty pixels in between and dilute the ESP (and
+    # the lighting and depth) 20-30x — the colour bar then reported a range
+    # far below the potential actually on the surface.
     wt_sum = np.zeros((proj_res, proj_res))
     np.add.at(wt_sum, (s_yi, s_xi), s_front_wt)
-    has_wt = wt_sum > 0
 
     # ESP weighted projection (shell only)
     esp_sum = np.zeros((proj_res, proj_res))
     np.add.at(esp_sum, (s_yi, s_xi), s_front_wt * s_esp)
-    grid_2d_esp = np.divide(esp_sum, wt_sum, out=np.zeros_like(esp_sum), where=has_wt)
 
     # --- 3D surface normal lighting (shell only) ---
     if normals_phys is not None:
@@ -239,12 +251,10 @@ def build_esp_surface(
 
     light_sum = np.zeros((proj_res, proj_res))
     np.add.at(light_sum, (s_yi, s_xi), s_front_wt * s_lambert)
-    grid_2d_light = np.divide(light_sum, wt_sum, out=np.full_like(light_sum, 0.65), where=has_wt)
 
     # --- Z-depth map for depth fading (shell only) ---
     z_sum = np.zeros((proj_res, proj_res))
     np.add.at(z_sum, (s_yi, s_xi), s_front_wt * s_z)
-    grid_2d_z = np.divide(z_sum, wt_sum, out=np.zeros_like(z_sum), where=has_wt)
 
     # Crop to non-zero bounding box + blur padding before blur/upsample.
     # Avoids processing large empty regions of the projection grid.
@@ -258,10 +268,39 @@ def build_esp_surface(
     c1 = min(proj_res, int(nz_cols.max()) + blur_pad + 1)
 
     _up = max(1, upsample // _PROJ_MULT)
-    blurred_dens = np.maximum(gaussian_blur_2d(grid_2d[r0:r1, c0:c1], _PROJ_BLUR), 0.0)
-    blurred_esp = gaussian_blur_2d(grid_2d_esp[r0:r1, c0:c1], _PROJ_BLUR * 1.5)
-    blurred_light = gaussian_blur_2d(grid_2d_light[r0:r1, c0:c1], _PROJ_BLUR * 0.5)
-    blurred_z = gaussian_blur_2d(grid_2d_z[r0:r1, c0:c1], _PROJ_BLUR * 0.8)
+    # The density blur is normalised by the *interior* hit density (the
+    # median over the pixels that received a voxel), not by the local one:
+    # a local ratio would carry the rim voxels' values outwards over the
+    # whole kernel and fatten the silhouette, while a constant keeps the
+    # original fall-off at the rim and restores the true magnitude inside.
+    # Without it the projected density was ~20x too small, so the surface
+    # was cut where the column maximum exceeds ~20 x isovalue instead of
+    # isovalue — and a cube whose maximum is below that showed nothing.
+    hit_crop = hit_2d[r0:r1, c0:c1]
+    hit_blur = gaussian_blur_2d(hit_crop, _PROJ_BLUR)
+    hit_inside = hit_blur[hit_crop > 0]
+    hit_norm = max(float(np.median(hit_inside)) if hit_inside.size else 1.0, 1e-12)
+    blurred_dens = np.maximum(
+        gaussian_blur_2d(grid_2d[r0:r1, c0:c1], _PROJ_BLUR) / np.maximum(hit_blur, hit_norm),
+        0.0,
+    )
+
+    def _weighted_blur(num: np.ndarray, sigma: float, fill: float) -> np.ndarray:
+        """Blur a weighted sum and its weights separately, then divide.
+
+        A normalised (Nadaraya-Watson) blur: pixels that received no shell
+        voxel contribute nothing instead of pulling the average towards
+        zero.  ``fill`` is only used where no weight reaches at all.
+        """
+        blurred = gaussian_blur_2d(num[r0:r1, c0:c1], sigma)
+        weight = gaussian_blur_2d(wt_sum[r0:r1, c0:c1], sigma)
+        return np.divide(
+            blurred, weight, out=np.full_like(blurred, fill), where=weight > 1e-12
+        )
+
+    blurred_esp = _weighted_blur(esp_sum, _PROJ_BLUR * 1.5, 0.0)
+    blurred_light = _weighted_blur(light_sum, _PROJ_BLUR * 0.5, 0.65)
+    blurred_z = _weighted_blur(z_sum, _PROJ_BLUR * 0.8, 0.0)
     up_dens = upsample_2d(blurred_dens, _up)
     up_esp = upsample_2d(blurred_esp, _up)
     up_light = upsample_2d(blurred_light, _up)

@@ -305,7 +305,10 @@ def test_render_svg_includes_esp_colorbar(caffeine_mol, caffeine_dens_cube, caff
 
     assert "linearGradient" in svg
     assert "\u2212" in svg
-    assert ".000" in svg
+    # The bar spans the potential on the surface (caffeine: a few 1e-2 a.u.),
+    # not the diluted 1e-3 a.u. the sparse-projection blur used to report.
+    assert cfg.esp_surface.esp_vmin < -0.01
+    assert cfg.esp_surface.esp_vmax > 0.01
 
 
 def test_render_svg_esp_palette_changes_colorbar(caffeine_mol, caffeine_dens_cube, caffeine_esp_cube):
@@ -341,6 +344,39 @@ def test_render_svg_esp_colorbar_uses_actual_range(caffeine_mol):
     assert ">.185</text>" in svg
     assert ">\u22120</text>" in svg
     assert ">.029</text>" in svg
+
+
+def test_esp_surface_range_matches_the_potential_on_the_shell():
+    """The projected ESP range must be the potential that sits on the isosurface.
+
+    The projection grid is finer than the cube grid, so most of its pixels
+    receive no shell voxel.  Blurring per-pixel means diluted the ESP with
+    those empty pixels (20-30x on a typical cube) and the colour bar reported
+    e.g. -0.001..0.000 a.u. for a benzene ring whose surface potential spans
+    -0.028..0.023 a.u.  A Gaussian blob coloured by its x coordinate has a
+    shell potential of +-R, so the 5-95 percentile range must reach most of
+    that (it is ~+-0.8 R on an unweighted disc).
+    """
+    from xyzrender.esp import build_esp_surface
+
+    n = 28
+    step = 0.5
+    axis = (np.arange(n) - (n - 1) / 2.0) * step
+    x, y, z = np.meshgrid(axis, axis, axis, indexing="ij")
+    radius = np.sqrt(x * x + y * y + z * z)
+    dens = np.exp(-((radius / 2.0) ** 2))
+    origin = (axis[0],) * 3
+    dens_cube = cube_from_array(dens, origin=origin)
+    esp_cube = cube_from_array(x, origin=origin)
+
+    iso = 0.1
+    shell_radius = 2.0 * np.sqrt(np.log(1.0 / iso))
+    surf = build_esp_surface(dens_cube, esp_cube, ESPParams(isovalue=iso))
+
+    assert surf.esp_vmax > 0.5 * shell_radius
+    assert surf.esp_vmin < -0.5 * shell_radius
+    assert surf.esp_vmax <= shell_radius * 1.05
+    assert surf.esp_vmin >= -shell_radius * 1.05
 
 
 def test_esp_surface_uses_manual_cmap_range(caffeine_mol, caffeine_dens_cube, caffeine_esp_cube):
