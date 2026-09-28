@@ -98,9 +98,8 @@ def build_esp_surface(
 ) -> ESPSurface:
     """Build an ESP surface: heatmap PNG + density contour layers.
 
-    Projects density and ESP to 2D, builds an RGB heatmap from ESP values
-    with 3D lighting, then extracts density contour rings for depth-graded
-    clip-path rendering.
+    Projects density and shell-averaged ESP to 2D, then clips a shaded
+    heatmap with density contour rings. This approximates an isosurface.
 
     Parameters
     ----------
@@ -127,7 +126,8 @@ def build_esp_surface(
     upsample:
         Integer upsampling factor for the ESP heatmap raster.
     esp_range:
-        Optional ``(vmin, vmax)`` range for ESP color mapping.
+        Optional ``(vmin, vmax)`` range for ESP color mapping. Defaults to
+        the 5th-95th percentiles of the projected ESP unless ``esp_symm`` is set.
     esp_symm:
         If ``True``, use a symmetric ESP range about zero based on the
         projected ESP values on the visible surface.
@@ -203,12 +203,9 @@ def build_esp_surface(
     # Density max-intensity projection (all voxels — needed for contours)
     grid_2d = np.zeros((proj_res, proj_res))
     np.maximum.at(grid_2d, (yi, xi), lobe_dens)
-    # Pixels that received at least one voxel.  The projection grid is
-    # ``_PROJ_MULT`` times finer than the cube (and covers only the lobe's
-    # bounding box), so most of its pixels receive none; the blur below is
-    # normalised by this so those empty pixels do not dilute the field.
-    hit_2d = np.zeros((proj_res, proj_res))
-    hit_2d[yi, xi] = 1.0
+    # Track occupied pixels for density normalization.
+    hit_2d = np.zeros_like(grid_2d, dtype=bool)
+    hit_2d[yi, xi] = True
 
     # Shell-only pixel coords for ESP/lighting/depth
     s_xi, s_yi = xi[shell], yi[shell]
@@ -219,16 +216,8 @@ def build_esp_surface(
     s_z_max = float(s_z.max()) if s_z.size > 0 else 0.0
     s_front_wt = np.exp((s_z - s_z_max) / _FRONT_DECAY)
 
-    # Shared front-weight accumulation (ESP, lighting, Z all use the same
-    # scatter coordinates and weights — accumulate once, reuse for all three).
-    #
-    # The weighted *sums* are kept as sums here and only divided by the
-    # (blurred) weights after the blur below.  The projection grid is
-    # ``_PROJ_MULT`` times finer than the cube grid, so only a few percent of
-    # its pixels ever receive a shell voxel; blurring per-pixel *means* would
-    # average them with the empty pixels in between and dilute the ESP (and
-    # the lighting and depth) 20-30x — the colour bar then reported a range
-    # far below the potential actually on the surface.
+    # Share weights across ESP, lighting, and depth. Normalize after blurring
+    # so empty projection pixels do not dilute the sampled values.
     wt_sum = np.zeros((proj_res, proj_res))
     np.add.at(wt_sum, (s_yi, s_xi), s_front_wt)
 
@@ -268,35 +257,22 @@ def build_esp_surface(
     c1 = min(proj_res, int(nz_cols.max()) + blur_pad + 1)
 
     _up = max(1, upsample // _PROJ_MULT)
-    # The density blur is normalised by the *interior* hit density (the
-    # median over the pixels that received a voxel), not by the local one:
-    # a local ratio would carry the rim voxels' values outwards over the
-    # whole kernel and fatten the silhouette, while a constant keeps the
-    # original fall-off at the rim and restores the true magnitude inside.
-    # Without it the projected density was ~20x too small, so the surface
-    # was cut where the column maximum exceeds ~20 x isovalue instead of
-    # isovalue — and a cube whose maximum is below that showed nothing.
+    # Normalize by blurred occupancy, floored at its median on occupied pixels.
+    # The floor preserves the edge fall-off instead of inflating the outline.
     hit_crop = hit_2d[r0:r1, c0:c1]
     hit_blur = gaussian_blur_2d(hit_crop, _PROJ_BLUR)
-    hit_inside = hit_blur[hit_crop > 0]
-    hit_norm = max(float(np.median(hit_inside)) if hit_inside.size else 1.0, 1e-12)
+    hit_inside = hit_blur[hit_crop]
+    hit_norm = max(float(np.median(hit_inside)), 1e-12)
     blurred_dens = np.maximum(
         gaussian_blur_2d(grid_2d[r0:r1, c0:c1], _PROJ_BLUR) / np.maximum(hit_blur, hit_norm),
         0.0,
     )
 
     def _weighted_blur(num: np.ndarray, sigma: float, fill: float) -> np.ndarray:
-        """Blur a weighted sum and its weights separately, then divide.
-
-        A normalised (Nadaraya-Watson) blur: pixels that received no shell
-        voxel contribute nothing instead of pulling the average towards
-        zero.  ``fill`` is only used where no weight reaches at all.
-        """
+        """Divide blurred sums by blurred weights; fill where weights are negligible."""
         blurred = gaussian_blur_2d(num[r0:r1, c0:c1], sigma)
         weight = gaussian_blur_2d(wt_sum[r0:r1, c0:c1], sigma)
-        return np.divide(
-            blurred, weight, out=np.full_like(blurred, fill), where=weight > 1e-12
-        )
+        return np.divide(blurred, weight, out=np.full_like(blurred, fill), where=weight > 1e-12)
 
     blurred_esp = _weighted_blur(esp_sum, _PROJ_BLUR * 1.5, 0.0)
     blurred_light = _weighted_blur(light_sum, _PROJ_BLUR * 0.5, 0.65)
@@ -331,8 +307,7 @@ def build_esp_surface(
         abs_max = max(abs(float(esp_above.min())), abs(float(esp_above.max())))
         esp_vmin, esp_vmax = -abs_max, abs_max
     else:
-        esp_vmin = float(np.percentile(esp_above, 5))
-        esp_vmax = float(np.percentile(esp_above, 95))
+        esp_vmin, esp_vmax = map(float, np.percentile(esp_above, [5, 95]))
 
     # Normalize across the projected ESP range used for the colorbar so the
     # rendered surface and legend describe the same field.

@@ -305,8 +305,8 @@ def test_render_svg_includes_esp_colorbar(caffeine_mol, caffeine_dens_cube, caff
 
     assert "linearGradient" in svg
     assert "\u2212" in svg
-    # The bar spans the potential on the surface (caffeine: a few 1e-2 a.u.),
-    # not the diluted 1e-3 a.u. the sparse-projection blur used to report.
+    # Preserve the scale of caffeine's shell potential (a few 1e-2 a.u.).
+    assert cfg.esp_surface is not None
     assert cfg.esp_surface.esp_vmin < -0.01
     assert cfg.esp_surface.esp_vmax > 0.01
 
@@ -346,17 +346,8 @@ def test_render_svg_esp_colorbar_uses_actual_range(caffeine_mol):
     assert ">.029</text>" in svg
 
 
-def test_esp_surface_range_matches_the_potential_on_the_shell():
-    """The projected ESP range must be the potential that sits on the isosurface.
-
-    The projection grid is finer than the cube grid, so most of its pixels
-    receive no shell voxel.  Blurring per-pixel means diluted the ESP with
-    those empty pixels (20-30x on a typical cube) and the colour bar reported
-    e.g. -0.001..0.000 a.u. for a benzene ring whose surface potential spans
-    -0.028..0.023 a.u.  A Gaussian blob coloured by its x coordinate has a
-    shell potential of +-R, so the 5-95 percentile range must reach most of
-    that (it is ~+-0.8 R on an unweighted disc).
-    """
+def test_esp_surface_preserves_shell_potential_scale():
+    """A Gaussian density with ESP=x should retain a range comparable to its shell radius."""
     from xyzrender.esp import build_esp_surface
 
     n = 28
